@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>My Website</title>
+    <link rel="stylesheet" href="https://unpkg.com/missing.css@1.1.3">
+  </head>
+  <body>
+    <header>
+      <h1>Traffic Light Busy Indicators</h1>
+    </header>
+    <main>
+      <section>
+        <h2>Problem</h2>
+        <p>My partner and I interrupt eachother's flow. We minimize this by simply asking &quot;Talk?&quot;, but that is:</p>
+        <ul>
+        <li>Still an interruption</li>
+        <li>Sparks curiosity</li>
+        <li>Carries social pressure to engage</li>
+        </ul>
+      </section>
+      <section>
+        <h2>Solution</h2>
+        <p>Two traffic-light style desk indicators that allow us to each set our own status and view the other's.</p>
+        <h3>Minimal Features</h3>
+        <ul>
+        <li>LED for indicators</li>
+        <li>Switch, button, or other setting input</li>
+        <li>Enclosure for electronics</li>
+        </ul>
+        <h3>Additional Features</h3>
+        <ul>
+        <li>Connection to Google Calendar to use our work calendar meeting schedules as automated input</li>
+        <li>Prompt guessing if, and asking confirmation for whether, we are busy</li>
+        <li>Some kind of timer indicating how long we anticipate being in a given state</li>
+        <li>Audio output with silent switch</li>
+        </ul>
+      </section>
+      <section>
+        <h2>Inventory</h2>
+        <h3>Hardware</h3>
+        <ul>
+        <li>ESP32C3<ul>
+        <li>Seeed Studio chip with low-power mode, Wifi, and Bluetooth</li>
+        </ul>
+        </li>
+        <li>RGB LEDs</li>
+        <li>Wiring and solder</li>
+        <li>3D-printing capability for enclosure<ul>
+        <li>Ideally hardware-less</li>
+        </ul>
+        </li>
+        </ul>
+        <h3>Software</h3>
+        <ul>
+        <li>Rust program</li>
+        <li>MQTT, HTTP, or direct TCP telemetry between nodes</li>
+        </ul>
+      </section>
+      <section>
+        <h2>Plan</h2>
+        <h3>Planning &amp; Design</h3>
+        <p>Define precise requirements, select final components, and design the overall system architecture.</p>
+        <ol>
+        <li>Detailed Feature Specification</li>
+        </ol>
+        <ul>
+        <li>Define LED color mappings for each status (e.g., Red: Busy, Yellow: Wrapping Up, Green: Available, Blue: Meeting, Purple: Away).</li>
+        <li>Specify exact input mechanism (e.g., 3-position switch, multiple buttons, capacitive touch pad).</li>
+        <li>Outline user flow for manual status changes.</li>
+        <li>Detail Google Calendar integration requirements (which calendar to monitor, how often to check, how to handle conflicts with manual status).</li>
+        <li>Define logic for &quot;prompt guessing&quot; (e.g., 5 minutes before meeting, flash blue and await confirmation).</li>
+        <li>Decide on the display method for the timer (e.g., simple LED patterns, or acknowledge need for small OLED display if precise time is critical). Initial assumption: No OLED, use LED patterns.</li>
+        </ul>
+        <ol start="2">
+        <li>Hardware Design &amp; Component Selection</li>
+        </ol>
+        <ul>
+        <li>Select specific RGB LED model (common anode/cathode, brightness, size).</li>
+        <li>Determine appropriate resistors for the RGB LED based on ESP32C3 GPIO voltage and LED current requirements.</li>
+        <li>Finalize input mechanism choice (e.g., specific push buttons, toggle switch, or research ESP32C3 capacitive touch capabilities for &quot;hardware-less&quot; integration).</li>
+        <li>Sketch basic circuit diagram for ESP32C3, LED(s), and input(s).</li>
+        <li>List all necessary wiring, solder, and prototyping materials.</li>
+        </ul>
+        <ol start="3">
+        <li>Software Architecture &amp; API Research</li>
+        </ol>
+        <ul>
+        <li>Research Rust embedded development for ESP32C3 (e.g., esp-idf-hal, esp-idf-svc).</li>
+        <li>Investigate Google Calendar API for event retrieval (OAuth2 flow, necessary scopes, JSON response structure).</li>
+        <li>Choose inter-device communication protocol (e.g., MQTT, direct TCP/HTTP, ESP-NOW for local network). Recommendation: MQTT for robustness.</li>
+        <li>Define data structure for status messages exchanged between devices.</li>
+        <li>Outline main program loop and state machine for status management.</li>
+        </ul>
+        <ol start="4">
+        <li>Enclosure Design</li>
+        </ol>
+        <ul>
+        <li>Measure ESP32C3 board and components for accurate enclosure sizing.</li>
+        <li>Design 3D model for the enclosure, including:<ul>
+        <li>Mounting points/slots for ESP32C3 and LED.</li>
+        <li>Openings for LED light output.</li>
+        <li>Integration for chosen input mechanism (e.g., button holes, or thin areas for capacitive touch).</li>
+        <li>Ventilation if necessary.</li>
+        <li>Consider &quot;hardware-less&quot; aspects: snap-fit components, minimal screws.</li>
+        </ul>
+        </li>
+        <li>Plan for cable routing (e.g., USB power).</li>
+        </ul>
+        <h3>Hardware Prototyping &amp; Assembly</h3>
+        <p>Assemble and test the basic electronic components on a breadboard or perfboard.</p>
+        <ol>
+        <li>ESP32C3 Setup &amp; Basic LED Test</li>
+        </ol>
+        <ul>
+        <li>Install Rust toolchain for ESP32C3 development.</li>
+        <li>Connect ESP32C3 to power and computer.</li>
+        <li>Write a simple Rust &quot;blink&quot; program to verify ESP32C3 and development environment.</li>
+        <li>Connect RGB LED to ESP32C3 with current-limiting resistors.</li>
+        <li>Write Rust code to cycle through basic RGB colors (Red, Green, Blue) to test LED functionality.</li>
+        </ul>
+        <ol start="2">
+        <li>Input Mechanism Integration</li>
+        </ol>
+        <ul>
+        <li>Wire selected input mechanism (buttons/switch) to ESP32C3 GPIO pins.</li>
+        <li>Write Rust code to read input state and print to serial monitor.</li>
+        <li>Test input responsiveness and debouncing.</li>
+        <li>(If capacitive touch) Implement and test capacitive touch sensing on ESP32C3.</li>
+        </ul>
+        <ol start="3">
+        <li>Full Circuit Assembly</li>
+        </ol>
+        <ul>
+        <li>Assemble all components (ESP32C3, LED, input) on a breadboard or perfboard.</li>
+        <li>Verify all connections are correct and secure.</li>
+        <li>Perform a basic functional test of the combined hardware (e.g., input changes LED color).</li>
+        </ul>
+        <h3>Firmware Development</h3>
+        <p>Develop the complete Rust firmware for the ESP32C3, implementing all features.</p>
+        <ol>
+        <li>Basic Device Firmware</li>
+        </ol>
+        <ul>
+        <li>Implement state machine for LED colors based on manual input (Red, Yellow, Green).</li>
+        <li>Refine LED brightness and color mixing for desired visual effect.</li>
+        <li>Implement basic power management (e.g., light sleep when idle).</li>
+        </ul>
+        <ol start="2">
+        <li>Wi-Fi &amp; Network Connectivity</li>
+        </ol>
+        <ul>
+        <li>Implement Rust code for Wi-Fi station mode connection to a specified SSID/password.</li>
+        <li>Add error handling for Wi-Fi connection failures.</li>
+        <li>Implement network time synchronization (NTP) for accurate timekeeping.</li>
+        </ul>
+        <ol start="3">
+        <li>Google Calendar Integration</li>
+        </ol>
+        <ul>
+        <li>Set up Google Cloud Project and obtain OAuth2 credentials.</li>
+        <li>Implement OAuth2 token management (initial authorization, refresh token usage) on the ESP32C3 or via a helper script.</li>
+        <li>Write Rust code to make HTTP GET requests to the Google Calendar API.</li>
+        <li>Parse JSON responses from Google Calendar API to extract event data (start/end times, busy/free status).</li>
+        <li>Integrate calendar data into the device's status logic (e.g., override manual status during meetings).</li>
+        </ul>
+        <ol start="4">
+        <li>Inter-Device Communication</li>
+        </ol>
+        <ul>
+        <li>Set up an MQTT client in Rust on the ESP32C3.</li>
+        <li>Implement publishing of own status to a dedicated MQTT topic (e.g., traffic_light/user1/status).</li>
+        <li>Implement subscribing to the other device's MQTT topic (e.g., traffic_light/user2/status).</li>
+        <li>Update the secondary LED (or a portion of the RGB LED) to reflect the other user's status.</li>
+        </ul>
+        <ol start="5">
+        <li>User Interface &amp; Logic</li>
+        </ol>
+        <ul>
+        <li>Implement the &quot;prompt guessing&quot; logic (e.g., check calendar, if meeting soon, flash LED and wait for input confirmation).</li>
+        <li>Implement the timer indication (e.g., subtle LED pulsing frequency or color shifts based on remaining time).</li>
+        <li>Develop robust state management to handle transitions between manual, calendar-driven, and prompted states.</li>
+        <li>Implement graceful handling of network disconnections and API errors.</li>
+        </ul>
+        <ol start="6">
+        <li>Power Management</li>
+        </ol>
+        <ul>
+        <li>Optimize Rust code for low power consumption (e.g., putting Wi-Fi to sleep when not needed, deep sleep during long idle periods).</li>
+        <li>Test power consumption in various states.</li>
+        </ul>
+        <h3>Enclosure Fabrication &amp; Final Assembly</h3>
+        <p>Produce the 3D-printed enclosures and integrate the electronics.</p>
+        <ol>
+        <li>3D Printing</li>
+        </ol>
+        <ul>
+        <li>Print two copies of the designed enclosure.</li>
+        <li>Inspect prints for quality and fit. Make adjustments to the 3D model if necessary and reprint.</li>
+        </ul>
+        <ol start="2">
+        <li>Final Assembly</li>
+        </ol>
+        <ul>
+        <li>Mount the ESP32C3 and LED(s) securely within the enclosure.</li>
+        <li>Route wires neatly and ensure no shorts.</li>
+        <li>Secure the input mechanism (if physical) into its designated opening.</li>
+        <li>Close and secure the enclosure.</li>
+        </ul>
+        <h3>Testing &amp; Refinement</h3>
+        <p>Thoroughly test the complete system and make any necessary adjustments.</p>
+        <ol>
+        <li>Unit Testing</li>
+        </ol>
+        <ul>
+        <li>Test each software module (Wi-Fi, API calls, LED control, input handling) independently.</li>
+        <li>Verify correct state transitions in the firmware.</li>
+        </ul>
+        <ol start="2">
+        <li>Integration Testing</li>
+        </ol>
+        <ul>
+        <li>Test Wi-Fi connectivity and Google Calendar integration on a single device.</li>
+        <li>Test inter-device communication between the two units.</li>
+        <li>Verify manual status changes correctly propagate and display.</li>
+        <li>Test calendar-driven status changes and overrides.</li>
+        <li>Test &quot;prompt guessing&quot; and confirmation flow.</li>
+        <li>Test timer indication (if implemented via LED patterns).</li>
+        </ul>
+        <ol start="3">
+        <li>User Acceptance Testing</li>
+        </ol>
+        <ul>
+        <li>Place devices on desks and use them in a real-world scenario for a few days.</li>
+        <li>Gather feedback from both users on usability, clarity of indicators, and overall effectiveness.</li>
+        <li>Identify any bugs, unexpected behavior, or areas for improvement.</li>
+        </ul>
+        <ol start="4">
+        <li>Documentation &amp; Future Improvements</li>
+        </ol>
+        <ul>
+        <li>Document circuit diagram, 3D print files, and Rust code with comments.</li>
+        <li>List potential future enhancements (e.g., adding a small OLED screen, more complex timer display, mobile app integration via Bluetooth).</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
