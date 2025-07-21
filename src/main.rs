@@ -204,7 +204,7 @@ fn run_provisioning_mode(
     let wifi_config: Configuration = Configuration::AccessPoint(
         AccessPointConfiguration {
             ssid: "busyfi".try_into().unwrap(),
-            password: "busyfi".try_into().unwrap(),
+            password: "password".try_into().unwrap(),
             auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
             channel: 1,
             max_connections: 4,
