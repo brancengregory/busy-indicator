@@ -29,6 +29,7 @@ esp-idf-hal = "0.45.2"
 esp-idf-sys = "0.36.1"
 anyhow = "1.0.98"
 embedded-hal = "1.0.0"
+serde = "1.0.219"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
