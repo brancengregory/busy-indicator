@@ -1,13 +1,18 @@
 use esp_idf_hal::delay::Delay;
 use esp_idf_hal::gpio::{PinDriver, Gpio3, Gpio4, Output};
+use esp_idf_hal::io::Write;
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::EspDefaultNvs;
 use esp_idf_svc::wifi::{
     AccessPointConfiguration,
     ClientConfiguration,
     Configuration,
     EspWifi
+};
+use esp_idf_svc::http::server::{
+    EspHttpServer, Request, Response
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -216,6 +221,22 @@ fn run_provisioning_mode(
 
     wifi.start()?;
     info!("Wifi started");
+
+    let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration::default())?;
+    server.fn_handler(
+        "/",
+        Method::Get,
+        |mut request| {
+            let html_content = b"<html><body><h1>Hello world!</h1></body></html>";
+            let content_length = html_content.len();
+
+            let mut response = request.into_ok_response()?; // Get the mutable response object
+            response.write_all(html_content)?; // Write to it
+
+            // CRITICAL CHANGE: Return Ok(()) instead of Ok(response)
+            Ok::<(), anyhow::Error>(()) // The handler successfully completed its task
+        }
+    )?;
 
     loop {
         delay.delay_ms(1000); // Keep alive, let HTTP server handle requests
