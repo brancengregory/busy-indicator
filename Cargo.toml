@@ -39,6 +39,7 @@ embassy-time = { version = "0.5.0", features = ["log"] }
 esp-radio = { version = "0.17.0", features = [
   "esp-alloc",
   "esp32c3",
+	"esp-now",
   "log-04",
   "smoltcp",
   "unstable",
@@ -60,6 +61,8 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
+embassy-sync = "0.7.2"
+embassy-futures = "0.1.2"
 
 
 [profile.dev]
