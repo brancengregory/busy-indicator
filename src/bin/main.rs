@@ -13,8 +13,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer, with_timeout};
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Io, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{Input, InputConfig, Io, Level, Output, OutputConfig, Pull, WakeEvent};
 use esp_hal::handler;
+use esp_hal::rtc_cntl::{Rtc, sleep::GpioWakeupSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNow};
 use esp_radio::wifi::{ClientConfig, ModeConfig};
@@ -89,6 +90,7 @@ async fn main(spawner: Spawner) -> ! {
     let esp_now = interfaces.esp_now;
     esp_now.set_channel(11).unwrap();
 
+    let rtc = Rtc::new(peripherals.LPWR);
     info!("Radio initialized!");
 
     let led_local_red = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
@@ -106,9 +108,11 @@ async fn main(spawner: Spawner) -> ! {
             led_local_green,
             led_remote_red,
             led_remote_green,
+            rtc,
+            wifi_controller,
+            button,
         ))
         .unwrap();
-    spawner.spawn(button_task(button)).unwrap();
     spawner.spawn(esp_now_task(esp_now)).unwrap();
 
     info!("Tasks queued");
@@ -120,28 +124,6 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
 }
 
-#[embassy_executor::task]
-async fn button_task(mut button: Input<'static>) {
-    info!("Button task started");
-    loop {
-        button.wait_for_falling_edge().await;
-        Timer::after(Duration::from_millis(20)).await;
-
-        match with_timeout(Duration::from_millis(800), button.wait_for_rising_edge()).await {
-            Err(_) => {
-                info!("Long press detected");
-                let _ = COMMAND_CHANNEL.send(Command::SystemOnOff).await;
-                button.wait_for_rising_edge().await;
-            }
-            Ok(_) => {
-                info!("Single boring press");
-                let _ = COMMAND_CHANNEL.send(Command::ToggleLocal).await;
-            }
-        }
-        // Debounce wait
-        Timer::after(Duration::from_millis(50)).await;
-    }
-}
 
 #[embassy_executor::task]
 async fn traffic_task(
@@ -149,42 +131,82 @@ async fn traffic_task(
     mut led_local_green: Output<'static>,
     mut led_remote_red: Output<'static>,
     mut led_remote_green: Output<'static>,
+    mut rtc: Rtc<'static>,
+    mut wifi_controller: esp_radio::wifi::WifiController<'static>,
+    mut button: Input<'static>,
 ) {
     info!("Traffic task started");
-    let mut system_on = true;
+    let system_on = true;
     let mut local_is_red = true;
 
     loop {
-        let cmd = COMMAND_CHANNEL.receive().await;
+        if system_on {
+            match select(button.wait_for_falling_edge(), COMMAND_CHANNEL.receive()).await {
+                Either::First(_) => {
+                    // Button pressed
+                    Timer::after(Duration::from_millis(20)).await;
 
-        match cmd {
-            Command::SystemOnOff => {
-                system_on = !system_on;
-                if system_on {
-                    info!("System awake");
-                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                    let _ = SEND_CHANNEL.send(local_is_red).await;
-                } else {
-                    info!("System sleeping");
-                    led_local_red.set_low();
-                    led_local_green.set_low();
-                    led_remote_red.set_low();
-                    led_remote_green.set_low();
+                    match with_timeout(Duration::from_millis(2000), button.wait_for_rising_edge()).await {
+                        Err(_) => {
+                            info!("Long press detected - going to sleep");
+
+                            // Turn off LEDs
+                            led_local_red.set_low();
+                            led_local_green.set_low();
+                            led_remote_red.set_low();
+                            led_remote_green.set_low();
+
+                            // Stop radio
+                            let _ = wifi_controller.stop();
+
+                            // Wait for button release before sleeping
+                            button.wait_for_rising_edge().await;
+                            Timer::after(Duration::from_millis(50)).await;
+
+                            // Configure wakeup and sleep
+                            button.wakeup_enable(true, WakeEvent::LowLevel).unwrap();
+                            let wakeup_source = GpioWakeupSource::new();
+                            rtc.sleep_light(&[&wakeup_source]);
+
+                            // Woke up!
+                            info!("System awake from light sleep");
+                            let _ = wifi_controller.start();
+                            set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                            let _ = SEND_CHANNEL.send(local_is_red).await;
+
+                            // Wait for release of the wakeup press
+                            let _ = with_timeout(Duration::from_millis(1000), button.wait_for_rising_edge()).await;
+                            Timer::after(Duration::from_millis(50)).await;
+                        }
+                        Ok(_) => {
+                            info!("Single press - toggling state");
+                            local_is_red = !local_is_red;
+                            set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                            let _ = SEND_CHANNEL.send(local_is_red).await;
+                        }
+                    }
+                }
+                Either::Second(cmd) => {
+                    match cmd {
+                        Command::ToggleLocal => {
+                            // This shouldn't happen anymore since we handle button locally,
+                            // but for completeness:
+                            local_is_red = !local_is_red;
+                            set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                            let _ = SEND_CHANNEL.send(local_is_red).await;
+                        }
+                        Command::SystemOnOff => {
+                            // Handled by button logic above
+                        }
+                        Command::RemoteUpdate(is_red) => {
+                            set_leds(&mut led_remote_red, &mut led_remote_green, is_red);
+                        }
+                    }
                 }
             }
-            Command::ToggleLocal if system_on => {
-                local_is_red = !local_is_red;
-                set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-
-                // Signal esp-now task to broadcase state
-                let _ = SEND_CHANNEL.send(local_is_red).await;
-            }
-            Command::RemoteUpdate(is_red) if system_on => {
-                set_leds(&mut led_remote_red, &mut led_remote_green, is_red);
-            }
-            _ => {
-                info!("System is asleep - ignoring command");
-            }
+        } else {
+            // This part shouldn't be reached due to logic above, but safety loop:
+            Timer::after(Duration::from_millis(1000)).await;
         }
     }
 }
