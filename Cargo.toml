@@ -1,11 +1,11 @@
 [package]
 edition      = "2024"
-name         = "busy-indicator-new"
+name         = "busy-indicator"
 rust-version = "1.88"
 version      = "0.1.0"
 
 [[bin]]
-name = "busy-indicator-new"
+name = "busy-indicator"
 path = "./src/bin/main.rs"
 
 [dependencies]
