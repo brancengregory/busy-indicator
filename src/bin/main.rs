@@ -11,7 +11,7 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Io, Level, Output, OutputConfig, Pull, WakeEvent};
 use esp_hal::handler;
@@ -19,21 +19,76 @@ use esp_hal::rtc_cntl::{Rtc, sleep::GpioWakeupSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNow};
 use esp_radio::wifi::{ClientConfig, ModeConfig};
+use heapless::Vec;
 use log::info;
 
 // Timing constants (in milliseconds)
-const DEBOUNCE_MS: u64 = 30;
+const DEBOUNCE_MS: u64 = 50; // Increased from 30ms for better bounce suppression
 const BUTTON_POLL_MS: u64 = 50;
 const LONG_PRESS_THRESHOLD_MS: u64 = 1400;
 const LONG_PRESS_CONFIRM_MS: u64 = 2000;
 const BLINK_DURATION_MS: u64 = 100;
-const PRE_SLEEP_DELAY_MS: u64 = 50;
-const POST_WAKEUP_DELAY_MS: u64 = 50;
+const PRE_SLEEP_DELAY_MS: u64 = 100; // Increased for better settling before sleep
+const POST_WAKEUP_DELAY_MS: u64 = 200; // Increased for wake stabilization
+const POST_WAKE_SETTLE_MS: u64 = 500; // Time to ignore spurious presses after wake
 const WAKEUP_TIMEOUT_MS: u64 = 1000;
 const NUM_BLINKS: usize = 3;
 
 // WiFi/ESP-NOW constants
 const ESP_NOW_CHANNEL: u8 = 11;
+
+// Channels for inter-task communication
+static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, StateEvent, 8> = Channel::new();
+static EFFECT_CHANNEL: Channel<CriticalSectionRawMutex, Effect, 8> = Channel::new();
+static SLEEP_CHANNEL: Channel<CriticalSectionRawMutex, SleepCommand, 2> = Channel::new();
+static SEND_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
+
+/// System state - persists across light sleep
+#[derive(Debug, Clone, Copy)]
+struct SystemState {
+    local_red: bool,
+    remote_red: bool,
+    #[allow(dead_code)]
+    sleeping: bool,
+}
+
+impl Default for SystemState {
+    fn default() -> Self {
+        Self {
+            local_red: true,
+            remote_red: true,
+            sleeping: false,
+        }
+    }
+}
+
+/// Events that can change system state
+#[derive(Debug, Clone, Copy)]
+enum StateEvent {
+    ButtonPress,
+    ButtonLongPressStarted,
+    ButtonLongPress,
+    RemoteUpdate(bool),
+    WakeUp,
+}
+
+/// Effects to be executed based on state changes
+#[derive(Debug, Clone, Copy)]
+enum Effect {
+    SetLocalLed(bool),
+    SetRemoteLed(bool),
+    AllLedsOff,
+    BlinkLocal(usize),     // Blink current local color
+    BlinkBothLocal(usize), // Blink both local LEDs (for sleep/wake feedback)
+    BroadcastState(()),    // Unit type - state value retrieved from SystemState
+    RequestSleep,
+}
+
+/// Commands for sleep/wake operations
+#[derive(Debug, Clone, Copy)]
+enum SleepCommand {
+    EnterSleep,
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -42,23 +97,321 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 extern crate alloc;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
-pub enum Command {
-    ToggleLocal,        // Single press
-    SystemOnOff,        // Long press
-    RemoteUpdate(bool), // Received from ESP-NOW (true = Red, false = Green)
-}
-
-static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, Command, 4> = Channel::new();
-static SEND_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 
 #[handler]
 fn gpio_handler() {
-    // This can be empty. Its presence allows the hardware
-    // to trigger the Embassy executor to wake up tasks.
+    // Empty handler allows hardware to trigger Embassy executor wakeup
+}
+
+/// Pure state transition function - no side effects, easily testable
+fn transition(state: SystemState, event: StateEvent) -> (SystemState, Vec<Effect, 8>) {
+    let mut effects = Vec::new();
+
+    let new_state = match event {
+        StateEvent::ButtonPress => {
+            let new_local = !state.local_red;
+            effects.push(Effect::SetLocalLed(new_local)).ok();
+            effects.push(Effect::BroadcastState(())).ok();
+            SystemState {
+                local_red: new_local,
+                ..state
+            }
+        }
+
+        StateEvent::ButtonLongPressStarted => {
+            effects.push(Effect::BlinkBothLocal(NUM_BLINKS)).ok();
+            state
+        }
+
+        StateEvent::ButtonLongPress => {
+            effects.push(Effect::AllLedsOff).ok();
+            effects.push(Effect::RequestSleep).ok();
+            SystemState {
+                sleeping: true,
+                ..state
+            }
+        }
+
+        StateEvent::RemoteUpdate(peer_red) => {
+            effects.push(Effect::SetRemoteLed(peer_red)).ok();
+            SystemState {
+                remote_red: peer_red,
+                ..state
+            }
+        }
+
+        StateEvent::WakeUp => {
+            effects.push(Effect::BlinkBothLocal(NUM_BLINKS)).ok();
+            effects.push(Effect::SetLocalLed(state.local_red)).ok();
+            effects.push(Effect::SetRemoteLed(state.remote_red)).ok();
+            effects.push(Effect::BroadcastState(())).ok();
+            SystemState {
+                sleeping: false,
+                ..state
+            }
+        }
+    };
+
+    (new_state, effects)
+}
+
+/// Helper function to set LED pair
+fn set_leds(red: &mut Output, green: &mut Output, is_red: bool) {
+    if is_red {
+        let _ = red.set_high();
+        let _ = green.set_low();
+    } else {
+        let _ = red.set_low();
+        let _ = green.set_high();
+    }
+}
+
+/// Retry LED update with logging on failure
+async fn update_led_with_retry(red: &mut Output<'_>, green: &mut Output<'_>, is_red: bool) {
+    for attempt in 0..3 {
+        set_leds(red, green, is_red);
+        Timer::after(Duration::from_millis(1)).await;
+
+        let red_high = red.is_set_high();
+        let green_low = !green.is_set_high();
+
+        if (is_red && red_high && green_low) || (!is_red && !red_high && !green_low) {
+            return;
+        }
+
+        if attempt < 2 {
+            log::error!("LED update failed (attempt {}), retrying...", attempt + 1);
+            Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+
+    log::error!("LED update failed permanently after 3 attempts");
+}
+
+#[embassy_executor::task]
+async fn state_manager() {
+    info!("State manager started");
+    let mut state = SystemState::default();
+    let event_rx = EVENT_CHANNEL.receiver();
+    let effect_tx = EFFECT_CHANNEL.sender();
+    let sleep_tx = SLEEP_CHANNEL.sender();
+
+    loop {
+        let event = event_rx.receive().await;
+        info!("Processing event: {:?}", event);
+
+        let (new_state, effects) = transition(state, event);
+        state = new_state;
+
+        for effect in effects {
+            match effect {
+                Effect::RequestSleep => {
+                    sleep_tx.send(SleepCommand::EnterSleep).await;
+                }
+                _ => {
+                    effect_tx.send(effect).await;
+                }
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn led_controller(
+    mut local_red: Output<'static>,
+    mut local_green: Output<'static>,
+    mut remote_red: Output<'static>,
+    mut remote_green: Output<'static>,
+) {
+    info!("LED controller started");
+    let effect_rx = EFFECT_CHANNEL.receiver();
+
+    loop {
+        match effect_rx.receive().await {
+            Effect::SetLocalLed(is_red) => {
+                update_led_with_retry(&mut local_red, &mut local_green, is_red).await;
+            }
+            Effect::SetRemoteLed(is_red) => {
+                update_led_with_retry(&mut remote_red, &mut remote_green, is_red).await;
+            }
+            Effect::AllLedsOff => {
+                let _ = local_red.set_low();
+                let _ = local_green.set_low();
+                let _ = remote_red.set_low();
+                let _ = remote_green.set_low();
+            }
+            Effect::BlinkLocal(count) => {
+                let original_red = local_red.is_set_high();
+                for _ in 0..count {
+                    let _ = local_red.set_low();
+                    let _ = local_green.set_low();
+                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+
+                    if original_red {
+                        let _ = local_red.set_high();
+                    } else {
+                        let _ = local_green.set_high();
+                    }
+                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                }
+                update_led_with_retry(&mut local_red, &mut local_green, original_red).await;
+            }
+            Effect::BlinkBothLocal(count) => {
+                // Flash both local LEDs together (for sleep/wake feedback)
+                let original_red = local_red.is_set_high();
+                for _ in 0..count {
+                    // Both OFF
+                    let _ = local_red.set_low();
+                    let _ = local_green.set_low();
+                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+
+                    // Both ON (orange/amber color)
+                    let _ = local_red.set_high();
+                    let _ = local_green.set_high();
+                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                }
+                // Restore original state
+                update_led_with_retry(&mut local_red, &mut local_green, original_red).await;
+            }
+            Effect::BroadcastState(_) | Effect::RequestSleep => {
+                // Handled by other tasks
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
+    info!("Button task started");
+    let event_tx = EVENT_CHANNEL.sender();
+    let sleep_rx = SLEEP_CHANNEL.receiver();
+
+    loop {
+        // Wait for either button press or sleep command
+        match select(button.wait_for_falling_edge(), sleep_rx.receive()).await {
+            Either::First(_) => {
+                // Button pressed
+                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+
+                let mut hold_time = Duration::from_millis(DEBOUNCE_MS);
+                let mut long_press_confirmed = false;
+                let mut aborted_during_blink = false;
+
+                while button.is_low() {
+                    if hold_time >= Duration::from_millis(LONG_PRESS_THRESHOLD_MS) {
+                        // Emit feedback event
+                        event_tx.send(StateEvent::ButtonLongPressStarted).await;
+
+                        // Wait for blink feedback to complete (600ms)
+                        for _ in 0..NUM_BLINKS {
+                            Timer::after(Duration::from_millis(BLINK_DURATION_MS * 2)).await;
+                            hold_time += Duration::from_millis(BLINK_DURATION_MS * 2);
+                            if !button.is_low() {
+                                // Button released during blink - debounce the release
+                                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                                if !button.is_low() {
+                                    aborted_during_blink = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !aborted_during_blink
+                            && hold_time >= Duration::from_millis(LONG_PRESS_CONFIRM_MS)
+                        {
+                            long_press_confirmed = true;
+                        }
+                        break;
+                    }
+
+                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                    hold_time += Duration::from_millis(BUTTON_POLL_MS);
+                }
+
+                // Debounce button release for normal press detection
+                if !long_press_confirmed && !aborted_during_blink {
+                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                }
+
+                if long_press_confirmed {
+                    event_tx.send(StateEvent::ButtonLongPress).await;
+                } else if !aborted_during_blink
+                    && hold_time < Duration::from_millis(LONG_PRESS_THRESHOLD_MS)
+                {
+                    event_tx.send(StateEvent::ButtonPress).await;
+                }
+            }
+            Either::Second(SleepCommand::EnterSleep) => {
+                // Perform sleep operation
+                info!("Entering light sleep");
+
+                // Wait for button release before sleeping with debounce
+                if button.is_low() {
+                    button.wait_for_rising_edge().await;
+                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                }
+                Timer::after(Duration::from_millis(PRE_SLEEP_DELAY_MS)).await;
+
+                // Configure wakeup
+                if let Err(e) = button.wakeup_enable(true, WakeEvent::LowLevel) {
+                    log::error!("Failed to enable button wakeup: {:?}", e);
+                    event_tx.send(StateEvent::WakeUp).await;
+                    continue;
+                }
+
+                let wakeup_source = GpioWakeupSource::new();
+                rtc.sleep_light(&[&wakeup_source]);
+
+                // Woke up!
+                info!("Woke up from sleep");
+                event_tx.send(StateEvent::WakeUp).await;
+
+                // Wait for button release after wake with extended settling
+                Timer::after(Duration::from_millis(POST_WAKEUP_DELAY_MS)).await;
+
+                // Ensure button is released and stable before accepting new presses
+                if button.is_low() {
+                    button.wait_for_rising_edge().await;
+                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                }
+
+                // Additional settling period to ignore spurious wake bounces
+                Timer::after(Duration::from_millis(POST_WAKE_SETTLE_MS)).await;
+                info!("Button settled after wake");
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn esp_now_task(mut esp_now: EspNow<'static>) {
+    info!("ESP-NOW task started");
+    let event_tx = EVENT_CHANNEL.sender();
+
+    loop {
+        match select(esp_now.receive_async(), SEND_CHANNEL.receive()).await {
+            Either::First(res) => {
+                let data = res.data();
+                if !data.is_empty() {
+                    let peer_red = data[0] == 1;
+                    info!(
+                        "Data received from peer: {}",
+                        if peer_red { "RED" } else { "GREEN" }
+                    );
+                    event_tx.send(StateEvent::RemoteUpdate(peer_red)).await;
+                }
+            }
+            Either::Second(local_red_state) => {
+                let status = if local_red_state { 1 } else { 0 };
+                let _ = esp_now.send_async(&BROADCAST_ADDRESS, &[status]).await;
+                info!(
+                    "Broadcasted local state: {}",
+                    if local_red_state { "RED" } else { "GREEN" }
+                );
+            }
+        }
+    }
 }
 
 #[allow(
@@ -67,10 +420,8 @@ fn gpio_handler() {
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // generator version: 1.2.0
-
     esp_println::logger::init_logger_from_env();
-    info!("Logging initialized");
+    info!("System starting");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -85,7 +436,7 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    info!("Embassy initialized!");
+    info!("Embassy initialized");
 
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     let radio_init = alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_init));
@@ -105,7 +456,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_now.set_channel(ESP_NOW_CHANNEL).unwrap();
 
     let rtc = Rtc::new(peripherals.LPWR);
-    info!("Radio initialized!");
+    info!("Radio initialized");
 
     let led_local_red = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
     let led_local_green = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
@@ -116,217 +467,22 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
+    // Spawn all tasks
+    spawner.spawn(state_manager()).unwrap();
     spawner
-        .spawn(traffic_task(
+        .spawn(led_controller(
             led_local_red,
             led_local_green,
             led_remote_red,
             led_remote_green,
-            rtc,
-            wifi_controller,
-            button,
         ))
         .unwrap();
+    spawner.spawn(button_task(button, rtc)).unwrap();
     spawner.spawn(esp_now_task(esp_now)).unwrap();
 
-    info!("Tasks queued");
+    info!("All tasks spawned");
 
     loop {
         Timer::after(Duration::from_secs(3600)).await;
-    }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
-}
-
-#[embassy_executor::task]
-async fn traffic_task(
-    mut led_local_red: Output<'static>,
-    mut led_local_green: Output<'static>,
-    mut led_remote_red: Output<'static>,
-    mut led_remote_green: Output<'static>,
-    mut rtc: Rtc<'static>,
-    mut wifi_controller: esp_radio::wifi::WifiController<'static>,
-    mut button: Input<'static>,
-) {
-    info!("Traffic task started");
-    let mut local_is_red = true;
-
-    loop {
-        match select(button.wait_for_falling_edge(), COMMAND_CHANNEL.receive()).await {
-            Either::First(_) => {
-                // Button pressed
-                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-
-                let mut hold_time = Duration::from_millis(DEBOUNCE_MS);
-                let mut long_press_confirmed = false;
-                let mut aborted_during_blink = false;
-
-                while button.is_low() {
-                    if hold_time >= Duration::from_millis(LONG_PRESS_THRESHOLD_MS) {
-                        // Start 3 quick blinks (600ms total)
-                        for _ in 0..NUM_BLINKS {
-                            // Blink OFF
-                            if local_is_red {
-                                led_local_red.set_low();
-                            } else {
-                                led_local_green.set_low();
-                            }
-                            Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-                            hold_time += Duration::from_millis(BLINK_DURATION_MS);
-                            if !button.is_low() {
-                                aborted_during_blink = true;
-                                break;
-                            }
-
-                            // Blink ON
-                            if local_is_red {
-                                led_local_red.set_high();
-                            } else {
-                                led_local_green.set_high();
-                            }
-                            Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-                            hold_time += Duration::from_millis(BLINK_DURATION_MS);
-                            if !button.is_low()
-                                && hold_time < Duration::from_millis(LONG_PRESS_CONFIRM_MS)
-                            {
-                                aborted_during_blink = true;
-                                break;
-                            }
-                        }
-
-                        if !aborted_during_blink
-                            && hold_time >= Duration::from_millis(LONG_PRESS_CONFIRM_MS)
-                        {
-                            long_press_confirmed = true;
-                        }
-                        break;
-                    }
-
-                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
-                    hold_time += Duration::from_millis(BUTTON_POLL_MS);
-                }
-
-                if long_press_confirmed {
-                    info!("Long press detected - going to sleep");
-
-                    // Turn off LEDs
-                    led_local_red.set_low();
-                    led_local_green.set_low();
-                    led_remote_red.set_low();
-                    led_remote_green.set_low();
-
-                    // Stop radio
-                    let _ = wifi_controller.stop();
-
-                    // Wait for button release before sleeping
-                    if button.is_low() {
-                        button.wait_for_rising_edge().await;
-                    }
-                    Timer::after(Duration::from_millis(PRE_SLEEP_DELAY_MS)).await;
-
-                    // Configure wakeup and sleep
-                    button.wakeup_enable(true, WakeEvent::LowLevel).unwrap();
-                    let wakeup_source = GpioWakeupSource::new();
-                    rtc.sleep_light(&[&wakeup_source]);
-
-                    // Woke up!
-                    info!("System awake from light sleep");
-
-                    // 3 Quick Blinks on wakeup
-                    for _ in 0..NUM_BLINKS {
-                        if local_is_red {
-                            led_local_red.set_high();
-                        } else {
-                            led_local_green.set_high();
-                        }
-                        Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-                        if local_is_red {
-                            led_local_red.set_low();
-                        } else {
-                            led_local_green.set_low();
-                        }
-                        Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-                    }
-
-                    let _ = wifi_controller.start();
-                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                    let _ = SEND_CHANNEL.send(local_is_red).await;
-
-                    // Wait for release of the wakeup press
-                    let _ = with_timeout(
-                        Duration::from_millis(WAKEUP_TIMEOUT_MS),
-                        button.wait_for_rising_edge(),
-                    )
-                    .await;
-                    Timer::after(Duration::from_millis(POST_WAKEUP_DELAY_MS)).await;
-                } else if !aborted_during_blink
-                    && hold_time < Duration::from_millis(LONG_PRESS_THRESHOLD_MS)
-                {
-                    // Single press
-                    info!("Single press - toggling state");
-                    local_is_red = !local_is_red;
-                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                    let _ = SEND_CHANNEL.send(local_is_red).await;
-                } else {
-                    // Aborted during blink or released exactly at threshold
-                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                }
-            }
-            Either::Second(cmd) => {
-                match cmd {
-                    Command::ToggleLocal => {
-                        // This shouldn't happen anymore since we handle button locally,
-                        // but for completeness:
-                        local_is_red = !local_is_red;
-                        set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                        let _ = SEND_CHANNEL.send(local_is_red).await;
-                    }
-                    Command::SystemOnOff => {
-                        // Handled by button logic above
-                    }
-                    Command::RemoteUpdate(is_red) => {
-                        set_leds(&mut led_remote_red, &mut led_remote_green, is_red);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn esp_now_task(mut esp_now: EspNow<'static>) {
-    info!("ESP-NOW task started");
-    loop {
-        match select(esp_now.receive_async(), SEND_CHANNEL.receive()).await {
-            Either::First(res) => {
-                let data = res.data();
-                if !data.is_empty() {
-                    let peer_red = data[0] == 1;
-                    info!(
-                        "Data received from peer: {}",
-                        if peer_red { "RED" } else { "GREEN" }
-                    );
-                    let _ = COMMAND_CHANNEL.send(Command::RemoteUpdate(peer_red)).await;
-                }
-            }
-            Either::Second(local_red_state) => {
-                let status = if local_red_state { 1 } else { 0 };
-                let _ = esp_now.send_async(&BROADCAST_ADDRESS, &[status]).await;
-                info!(
-                    "Broadcasted local state: {}",
-                    if local_red_state { "RED" } else { "GREEN" }
-                );
-            }
-        }
-    }
-}
-
-fn set_leds(red: &mut Output, green: &mut Output, is_red: bool) {
-    if is_red {
-        red.set_high();
-        green.set_low();
-    } else {
-        red.set_low();
-        green.set_high();
     }
 }
