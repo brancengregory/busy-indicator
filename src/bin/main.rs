@@ -11,7 +11,7 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Io, Level, Output, OutputConfig, Pull, WakeEvent};
 use esp_hal::handler;
@@ -36,6 +36,47 @@ const NUM_BLINKS: usize = 3;
 
 // WiFi/ESP-NOW constants
 const ESP_NOW_CHANNEL: u8 = 11;
+
+/// LED pair abstraction for controlling red/green LED pairs
+struct LedPair<'a> {
+    red: Output<'a>,
+    green: Output<'a>,
+}
+
+impl<'a> LedPair<'a> {
+    /// Create a new LED pair from individual GPIO outputs
+    fn new(red: Output<'a>, green: Output<'a>) -> Self {
+        Self { red, green }
+    }
+
+    /// Set LED color (true = red, false = green)
+    fn set_color(&mut self, is_red: bool) {
+        if is_red {
+            let _ = self.red.set_high();
+            let _ = self.green.set_low();
+        } else {
+            let _ = self.red.set_low();
+            let _ = self.green.set_high();
+        }
+    }
+
+    /// Turn both LEDs off
+    fn off(&mut self) {
+        let _ = self.red.set_low();
+        let _ = self.green.set_low();
+    }
+
+    /// Turn both LEDs on (creates orange/amber color)
+    fn both_on(&mut self) {
+        let _ = self.red.set_high();
+        let _ = self.green.set_high();
+    }
+
+    /// Check if currently showing red
+    fn is_red(&self) -> bool {
+        self.red.is_set_high() && !self.green.is_set_high()
+    }
+}
 
 // Channels for inter-task communication
 static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, StateEvent, 8> = Channel::new();
@@ -78,9 +119,8 @@ enum Effect {
     SetLocalLed(bool),
     SetRemoteLed(bool),
     AllLedsOff,
-    BlinkLocal(usize),     // Blink current local color
-    BlinkBothLocal(usize), // Blink both local LEDs (for sleep/wake feedback)
-    BroadcastState(()),    // Unit type - state value retrieved from SystemState
+    BlinkLocal(usize),  // Blink both local LEDs together (orange/amber feedback)
+    BroadcastState(()), // Unit type - state value retrieved from SystemState
     RequestSleep,
 }
 
@@ -120,7 +160,7 @@ fn transition(state: SystemState, event: StateEvent) -> (SystemState, Vec<Effect
         }
 
         StateEvent::ButtonLongPressStarted => {
-            effects.push(Effect::BlinkBothLocal(NUM_BLINKS)).ok();
+            effects.push(Effect::BlinkLocal(NUM_BLINKS)).ok();
             state
         }
 
@@ -142,7 +182,7 @@ fn transition(state: SystemState, event: StateEvent) -> (SystemState, Vec<Effect
         }
 
         StateEvent::WakeUp => {
-            effects.push(Effect::BlinkBothLocal(NUM_BLINKS)).ok();
+            effects.push(Effect::BlinkLocal(NUM_BLINKS)).ok();
             effects.push(Effect::SetLocalLed(state.local_red)).ok();
             effects.push(Effect::SetRemoteLed(state.remote_red)).ok();
             effects.push(Effect::BroadcastState(())).ok();
@@ -156,25 +196,14 @@ fn transition(state: SystemState, event: StateEvent) -> (SystemState, Vec<Effect
     (new_state, effects)
 }
 
-/// Helper function to set LED pair
-fn set_leds(red: &mut Output, green: &mut Output, is_red: bool) {
-    if is_red {
-        let _ = red.set_high();
-        let _ = green.set_low();
-    } else {
-        let _ = red.set_low();
-        let _ = green.set_high();
-    }
-}
-
 /// Retry LED update with logging on failure
-async fn update_led_with_retry(red: &mut Output<'_>, green: &mut Output<'_>, is_red: bool) {
+async fn update_led_with_retry(led: &mut LedPair<'_>, is_red: bool) {
     for attempt in 0..3 {
-        set_leds(red, green, is_red);
+        led.set_color(is_red);
         Timer::after(Duration::from_millis(1)).await;
 
-        let red_high = red.is_set_high();
-        let green_low = !green.is_set_high();
+        let red_high = led.red.is_set_high();
+        let green_low = !led.green.is_set_high();
 
         if (is_red && red_high && green_low) || (!is_red && !red_high && !green_low) {
             return;
@@ -218,61 +247,36 @@ async fn state_manager() {
 }
 
 #[embassy_executor::task]
-async fn led_controller(
-    mut local_red: Output<'static>,
-    mut local_green: Output<'static>,
-    mut remote_red: Output<'static>,
-    mut remote_green: Output<'static>,
-) {
+async fn led_controller(mut local: LedPair<'static>, mut remote: LedPair<'static>) {
     info!("LED controller started");
     let effect_rx = EFFECT_CHANNEL.receiver();
 
     loop {
         match effect_rx.receive().await {
             Effect::SetLocalLed(is_red) => {
-                update_led_with_retry(&mut local_red, &mut local_green, is_red).await;
+                update_led_with_retry(&mut local, is_red).await;
             }
             Effect::SetRemoteLed(is_red) => {
-                update_led_with_retry(&mut remote_red, &mut remote_green, is_red).await;
+                update_led_with_retry(&mut remote, is_red).await;
             }
             Effect::AllLedsOff => {
-                let _ = local_red.set_low();
-                let _ = local_green.set_low();
-                let _ = remote_red.set_low();
-                let _ = remote_green.set_low();
+                local.off();
+                remote.off();
             }
             Effect::BlinkLocal(count) => {
-                let original_red = local_red.is_set_high();
-                for _ in 0..count {
-                    let _ = local_red.set_low();
-                    let _ = local_green.set_low();
-                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-
-                    if original_red {
-                        let _ = local_red.set_high();
-                    } else {
-                        let _ = local_green.set_high();
-                    }
-                    Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
-                }
-                update_led_with_retry(&mut local_red, &mut local_green, original_red).await;
-            }
-            Effect::BlinkBothLocal(count) => {
-                // Flash both local LEDs together (for sleep/wake feedback)
-                let original_red = local_red.is_set_high();
+                // Flash both local LEDs together (orange/amber color)
+                let original_red = local.is_red();
                 for _ in 0..count {
                     // Both OFF
-                    let _ = local_red.set_low();
-                    let _ = local_green.set_low();
+                    local.off();
                     Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
 
                     // Both ON (orange/amber color)
-                    let _ = local_red.set_high();
-                    let _ = local_green.set_high();
+                    local.both_on();
                     Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
                 }
                 // Restore original state
-                update_led_with_retry(&mut local_red, &mut local_green, original_red).await;
+                update_led_with_retry(&mut local, original_red).await;
             }
             Effect::BroadcastState(_) | Effect::RequestSleep => {
                 // Handled by other tasks
@@ -372,8 +376,23 @@ async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
 
                 // Ensure button is released and stable before accepting new presses
                 if button.is_low() {
-                    button.wait_for_rising_edge().await;
-                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                    // Wait for button release with timeout (safety in case button is stuck)
+                    match with_timeout(
+                        Duration::from_millis(WAKEUP_TIMEOUT_MS),
+                        button.wait_for_rising_edge(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Button release timeout after {}ms, continuing anyway",
+                                WAKEUP_TIMEOUT_MS
+                            );
+                        }
+                    }
                 }
 
                 // Additional settling period to ignore spurious wake bounces
@@ -458,10 +477,15 @@ async fn main(spawner: Spawner) -> ! {
     let rtc = Rtc::new(peripherals.LPWR);
     info!("Radio initialized");
 
-    let led_local_red = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
-    let led_local_green = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
-    let led_remote_red = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
-    let led_remote_green = Output::new(peripherals.GPIO20, Level::Low, OutputConfig::default());
+    // Create LED pairs
+    let local_pair = LedPair::new(
+        Output::new(peripherals.GPIO3, Level::High, OutputConfig::default()),
+        Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default()),
+    );
+    let remote_pair = LedPair::new(
+        Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
+        Output::new(peripherals.GPIO20, Level::Low, OutputConfig::default()),
+    );
     let button = Input::new(
         peripherals.GPIO10,
         InputConfig::default().with_pull(Pull::Up),
@@ -470,12 +494,7 @@ async fn main(spawner: Spawner) -> ! {
     // Spawn all tasks
     spawner.spawn(state_manager()).unwrap();
     spawner
-        .spawn(led_controller(
-            led_local_red,
-            led_local_green,
-            led_remote_red,
-            led_remote_green,
-        ))
+        .spawn(led_controller(local_pair, remote_pair))
         .unwrap();
     spawner.spawn(button_task(button, rtc)).unwrap();
     spawner.spawn(esp_now_task(esp_now)).unwrap();
