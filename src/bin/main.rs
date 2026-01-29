@@ -21,6 +21,20 @@ use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNow};
 use esp_radio::wifi::{ClientConfig, ModeConfig};
 use log::info;
 
+// Timing constants (in milliseconds)
+const DEBOUNCE_MS: u64 = 30;
+const BUTTON_POLL_MS: u64 = 50;
+const LONG_PRESS_THRESHOLD_MS: u64 = 1400;
+const LONG_PRESS_CONFIRM_MS: u64 = 2000;
+const BLINK_DURATION_MS: u64 = 100;
+const PRE_SLEEP_DELAY_MS: u64 = 50;
+const POST_WAKEUP_DELAY_MS: u64 = 50;
+const WAKEUP_TIMEOUT_MS: u64 = 1000;
+const NUM_BLINKS: usize = 3;
+
+// WiFi/ESP-NOW constants
+const ESP_NOW_CHANNEL: u8 = 11;
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
@@ -88,7 +102,7 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to start Wi-Fi controller");
 
     let esp_now = interfaces.esp_now;
-    esp_now.set_channel(11).unwrap();
+    esp_now.set_channel(ESP_NOW_CHANNEL).unwrap();
 
     let rtc = Rtc::new(peripherals.LPWR);
     info!("Radio initialized!");
@@ -135,146 +149,146 @@ async fn traffic_task(
     mut button: Input<'static>,
 ) {
     info!("Traffic task started");
-    let system_on = true;
     let mut local_is_red = true;
 
     loop {
-        if system_on {
-            match select(button.wait_for_falling_edge(), COMMAND_CHANNEL.receive()).await {
-                Either::First(_) => {
-                    // Button pressed
-                    Timer::after(Duration::from_millis(30)).await;
+        match select(button.wait_for_falling_edge(), COMMAND_CHANNEL.receive()).await {
+            Either::First(_) => {
+                // Button pressed
+                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
 
-                    let mut hold_time = Duration::from_millis(30);
-                    let mut long_press_confirmed = false;
-                    let mut aborted_during_blink = false;
+                let mut hold_time = Duration::from_millis(DEBOUNCE_MS);
+                let mut long_press_confirmed = false;
+                let mut aborted_during_blink = false;
 
-                    while button.is_low() {
-                        if hold_time >= Duration::from_millis(1400) {
-                            // Start 3 quick blinks (600ms total)
-                            for _ in 0..3 {
-                                // Blink OFF
-                                if local_is_red {
-                                    led_local_red.set_low();
-                                } else {
-                                    led_local_green.set_low();
-                                }
-                                Timer::after(Duration::from_millis(100)).await;
-                                hold_time += Duration::from_millis(100);
-                                if !button.is_low() {
-                                    aborted_during_blink = true;
-                                    break;
-                                }
-
-                                // Blink ON
-                                if local_is_red {
-                                    led_local_red.set_high();
-                                } else {
-                                    led_local_green.set_high();
-                                }
-                                Timer::after(Duration::from_millis(100)).await;
-                                hold_time += Duration::from_millis(100);
-                                if !button.is_low() && hold_time < Duration::from_millis(2000) {
-                                    aborted_during_blink = true;
-                                    break;
-                                }
-                            }
-
-                            if !aborted_during_blink && hold_time >= Duration::from_millis(2000) {
-                                long_press_confirmed = true;
-                            }
-                            break;
-                        }
-
-                        Timer::after(Duration::from_millis(50)).await;
-                        hold_time += Duration::from_millis(50);
-                    }
-
-                    if long_press_confirmed {
-                        info!("Long press detected - going to sleep");
-
-                        // Turn off LEDs
-                        led_local_red.set_low();
-                        led_local_green.set_low();
-                        led_remote_red.set_low();
-                        led_remote_green.set_low();
-
-                        // Stop radio
-                        let _ = wifi_controller.stop();
-
-                        // Wait for button release before sleeping
-                        if button.is_low() {
-                            button.wait_for_rising_edge().await;
-                        }
-                        Timer::after(Duration::from_millis(50)).await;
-
-                        // Configure wakeup and sleep
-                        button.wakeup_enable(true, WakeEvent::LowLevel).unwrap();
-                        let wakeup_source = GpioWakeupSource::new();
-                        rtc.sleep_light(&[&wakeup_source]);
-
-                        // Woke up!
-                        info!("System awake from light sleep");
-
-                        // 3 Quick Blinks on wakeup
-                        for _ in 0..3 {
-                            if local_is_red {
-                                led_local_red.set_high();
-                            } else {
-                                led_local_green.set_high();
-                            }
-                            Timer::after(Duration::from_millis(100)).await;
+                while button.is_low() {
+                    if hold_time >= Duration::from_millis(LONG_PRESS_THRESHOLD_MS) {
+                        // Start 3 quick blinks (600ms total)
+                        for _ in 0..NUM_BLINKS {
+                            // Blink OFF
                             if local_is_red {
                                 led_local_red.set_low();
                             } else {
                                 led_local_green.set_low();
                             }
-                            Timer::after(Duration::from_millis(100)).await;
+                            Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                            hold_time += Duration::from_millis(BLINK_DURATION_MS);
+                            if !button.is_low() {
+                                aborted_during_blink = true;
+                                break;
+                            }
+
+                            // Blink ON
+                            if local_is_red {
+                                led_local_red.set_high();
+                            } else {
+                                led_local_green.set_high();
+                            }
+                            Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                            hold_time += Duration::from_millis(BLINK_DURATION_MS);
+                            if !button.is_low()
+                                && hold_time < Duration::from_millis(LONG_PRESS_CONFIRM_MS)
+                            {
+                                aborted_during_blink = true;
+                                break;
+                            }
                         }
 
-                        let _ = wifi_controller.start();
-                        set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                        let _ = SEND_CHANNEL.send(local_is_red).await;
+                        if !aborted_during_blink
+                            && hold_time >= Duration::from_millis(LONG_PRESS_CONFIRM_MS)
+                        {
+                            long_press_confirmed = true;
+                        }
+                        break;
+                    }
 
-                        // Wait for release of the wakeup press
-                        let _ = with_timeout(
-                            Duration::from_millis(1000),
-                            button.wait_for_rising_edge(),
-                        )
-                        .await;
-                        Timer::after(Duration::from_millis(50)).await;
-                    } else if !aborted_during_blink && hold_time < Duration::from_millis(1400) {
-                        // Single press
-                        info!("Single press - toggling state");
+                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                    hold_time += Duration::from_millis(BUTTON_POLL_MS);
+                }
+
+                if long_press_confirmed {
+                    info!("Long press detected - going to sleep");
+
+                    // Turn off LEDs
+                    led_local_red.set_low();
+                    led_local_green.set_low();
+                    led_remote_red.set_low();
+                    led_remote_green.set_low();
+
+                    // Stop radio
+                    let _ = wifi_controller.stop();
+
+                    // Wait for button release before sleeping
+                    if button.is_low() {
+                        button.wait_for_rising_edge().await;
+                    }
+                    Timer::after(Duration::from_millis(PRE_SLEEP_DELAY_MS)).await;
+
+                    // Configure wakeup and sleep
+                    button.wakeup_enable(true, WakeEvent::LowLevel).unwrap();
+                    let wakeup_source = GpioWakeupSource::new();
+                    rtc.sleep_light(&[&wakeup_source]);
+
+                    // Woke up!
+                    info!("System awake from light sleep");
+
+                    // 3 Quick Blinks on wakeup
+                    for _ in 0..NUM_BLINKS {
+                        if local_is_red {
+                            led_local_red.set_high();
+                        } else {
+                            led_local_green.set_high();
+                        }
+                        Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                        if local_is_red {
+                            led_local_red.set_low();
+                        } else {
+                            led_local_green.set_low();
+                        }
+                        Timer::after(Duration::from_millis(BLINK_DURATION_MS)).await;
+                    }
+
+                    let _ = wifi_controller.start();
+                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                    let _ = SEND_CHANNEL.send(local_is_red).await;
+
+                    // Wait for release of the wakeup press
+                    let _ = with_timeout(
+                        Duration::from_millis(WAKEUP_TIMEOUT_MS),
+                        button.wait_for_rising_edge(),
+                    )
+                    .await;
+                    Timer::after(Duration::from_millis(POST_WAKEUP_DELAY_MS)).await;
+                } else if !aborted_during_blink
+                    && hold_time < Duration::from_millis(LONG_PRESS_THRESHOLD_MS)
+                {
+                    // Single press
+                    info!("Single press - toggling state");
+                    local_is_red = !local_is_red;
+                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                    let _ = SEND_CHANNEL.send(local_is_red).await;
+                } else {
+                    // Aborted during blink or released exactly at threshold
+                    set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
+                }
+            }
+            Either::Second(cmd) => {
+                match cmd {
+                    Command::ToggleLocal => {
+                        // This shouldn't happen anymore since we handle button locally,
+                        // but for completeness:
                         local_is_red = !local_is_red;
                         set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
                         let _ = SEND_CHANNEL.send(local_is_red).await;
-                    } else {
-                        // Aborted during blink or released exactly at threshold
-                        set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
                     }
-                }
-                Either::Second(cmd) => {
-                    match cmd {
-                        Command::ToggleLocal => {
-                            // This shouldn't happen anymore since we handle button locally,
-                            // but for completeness:
-                            local_is_red = !local_is_red;
-                            set_leds(&mut led_local_red, &mut led_local_green, local_is_red);
-                            let _ = SEND_CHANNEL.send(local_is_red).await;
-                        }
-                        Command::SystemOnOff => {
-                            // Handled by button logic above
-                        }
-                        Command::RemoteUpdate(is_red) => {
-                            set_leds(&mut led_remote_red, &mut led_remote_green, is_red);
-                        }
+                    Command::SystemOnOff => {
+                        // Handled by button logic above
+                    }
+                    Command::RemoteUpdate(is_red) => {
+                        set_leds(&mut led_remote_red, &mut led_remote_green, is_red);
                     }
                 }
             }
-        } else {
-            // This part shouldn't be reached due to logic above, but safety loop:
-            Timer::after(Duration::from_millis(1000)).await;
         }
     }
 }
