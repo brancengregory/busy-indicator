@@ -124,7 +124,6 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
 }
 
-
 #[embassy_executor::task]
 async fn traffic_task(
     mut led_local_red: Output<'static>,
@@ -155,13 +154,24 @@ async fn traffic_task(
                             // Start 3 quick blinks (600ms total)
                             for _ in 0..3 {
                                 // Blink OFF
-                                if local_is_red { led_local_red.set_low(); } else { led_local_green.set_low(); }
+                                if local_is_red {
+                                    led_local_red.set_low();
+                                } else {
+                                    led_local_green.set_low();
+                                }
                                 Timer::after(Duration::from_millis(100)).await;
                                 hold_time += Duration::from_millis(100);
-                                if !button.is_low() { aborted_during_blink = true; break; }
+                                if !button.is_low() {
+                                    aborted_during_blink = true;
+                                    break;
+                                }
 
                                 // Blink ON
-                                if local_is_red { led_local_red.set_high(); } else { led_local_green.set_high(); }
+                                if local_is_red {
+                                    led_local_red.set_high();
+                                } else {
+                                    led_local_green.set_high();
+                                }
                                 Timer::after(Duration::from_millis(100)).await;
                                 hold_time += Duration::from_millis(100);
                                 if !button.is_low() && hold_time < Duration::from_millis(2000) {
@@ -208,9 +218,17 @@ async fn traffic_task(
 
                         // 3 Quick Blinks on wakeup
                         for _ in 0..3 {
-                            if local_is_red { led_local_red.set_high(); } else { led_local_green.set_high(); }
+                            if local_is_red {
+                                led_local_red.set_high();
+                            } else {
+                                led_local_green.set_high();
+                            }
                             Timer::after(Duration::from_millis(100)).await;
-                            if local_is_red { led_local_red.set_low(); } else { led_local_green.set_low(); }
+                            if local_is_red {
+                                led_local_red.set_low();
+                            } else {
+                                led_local_green.set_low();
+                            }
                             Timer::after(Duration::from_millis(100)).await;
                         }
 
@@ -219,7 +237,11 @@ async fn traffic_task(
                         let _ = SEND_CHANNEL.send(local_is_red).await;
 
                         // Wait for release of the wakeup press
-                        let _ = with_timeout(Duration::from_millis(1000), button.wait_for_rising_edge()).await;
+                        let _ = with_timeout(
+                            Duration::from_millis(1000),
+                            button.wait_for_rising_edge(),
+                        )
+                        .await;
                         Timer::after(Duration::from_millis(50)).await;
                     } else if !aborted_during_blink && hold_time < Duration::from_millis(1400) {
                         // Single press
