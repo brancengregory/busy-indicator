@@ -78,11 +78,171 @@ impl<'a> LedPair<'a> {
     }
 }
 
+/// Configuration for button debounce and press detection timing
+#[derive(Debug, Clone, Copy)]
+struct ButtonConfig {
+    debounce_ms: u64,
+    long_press_threshold_ms: u64,
+    long_press_confirm_ms: u64,
+}
+
+impl ButtonConfig {
+    /// Create a new config with sensible defaults
+    fn new() -> Self {
+        Self {
+            debounce_ms: DEBOUNCE_MS,
+            long_press_threshold_ms: LONG_PRESS_THRESHOLD_MS,
+            long_press_confirm_ms: LONG_PRESS_CONFIRM_MS,
+        }
+    }
+
+    /// Set debounce duration
+    #[allow(dead_code)]
+    fn with_debounce(mut self, ms: u64) -> Self {
+        self.debounce_ms = ms;
+        self
+    }
+
+    /// Set long press threshold (when feedback starts)
+    #[allow(dead_code)]
+    fn with_long_press_threshold(mut self, ms: u64) -> Self {
+        self.long_press_threshold_ms = ms;
+        self
+    }
+
+    /// Set long press confirmation time (when sleep triggers)
+    #[allow(dead_code)]
+    fn with_long_press_confirm(mut self, ms: u64) -> Self {
+        self.long_press_confirm_ms = ms;
+        self
+    }
+}
+
+impl Default for ButtonConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Events emitted by button handler
+#[derive(Debug, Clone, Copy)]
+enum ButtonEvent {
+    Press,
+    LongPressStarted,
+    LongPress,
+}
+
+/// Button handler with debouncing and press detection
+struct ButtonHandler<'a> {
+    button: Input<'a>,
+    config: ButtonConfig,
+}
+
+impl<'a> ButtonHandler<'a> {
+    /// Create a new button handler with default config
+    fn new(button: Input<'a>) -> Self {
+        Self {
+            button,
+            config: ButtonConfig::default(),
+        }
+    }
+
+    /// Create a new button handler with custom config
+    #[allow(dead_code)]
+    fn with_config(button: Input<'a>, config: ButtonConfig) -> Self {
+        Self { button, config }
+    }
+
+    /// Check if button is currently pressed
+    fn is_pressed(&self) -> bool {
+        self.button.is_low()
+    }
+
+    /// Wait for button press with debounce, returns press event type
+    /// For long press, returns LongPressStarted at threshold, then caller should call wait_for_long_press_confirm()
+    async fn wait_for_press(&mut self) -> ButtonEvent {
+        // Wait for falling edge (press)
+        self.button.wait_for_falling_edge().await;
+        Timer::after(Duration::from_millis(self.config.debounce_ms)).await;
+
+        let mut hold_time = Duration::from_millis(self.config.debounce_ms);
+
+        while self.is_pressed() {
+            // Check if we've reached long press threshold
+            if hold_time >= Duration::from_millis(self.config.long_press_threshold_ms) {
+                return ButtonEvent::LongPressStarted;
+            }
+
+            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+            hold_time += Duration::from_millis(BUTTON_POLL_MS);
+        }
+
+        // Button released before threshold - debounce and return Press
+        Timer::after(Duration::from_millis(self.config.debounce_ms)).await;
+        ButtonEvent::Press
+    }
+
+    /// After receiving LongPressStarted, wait for confirmation or cancellation
+    async fn wait_for_long_press_confirm(&mut self) -> ButtonEvent {
+        let mut hold_time = Duration::from_millis(self.config.long_press_threshold_ms);
+
+        while self.is_pressed() {
+            // Check if we've reached confirmation time
+            if hold_time >= Duration::from_millis(self.config.long_press_confirm_ms) {
+                return ButtonEvent::LongPress;
+            }
+
+            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+            hold_time += Duration::from_millis(BUTTON_POLL_MS);
+        }
+
+        // Button released before confirmation
+        Timer::after(Duration::from_millis(self.config.debounce_ms)).await;
+        ButtonEvent::Press // Treat as normal press if released early
+    }
+
+    /// Wait for button release with debounce
+    async fn wait_for_release(&mut self) {
+        if self.is_pressed() {
+            self.button.wait_for_rising_edge().await;
+            Timer::after(Duration::from_millis(self.config.debounce_ms)).await;
+        }
+    }
+
+    /// Wait for button release with timeout
+    async fn wait_for_release_timeout(&mut self, timeout_ms: u64) -> Result<(), ()> {
+        if !self.is_pressed() {
+            return Ok(());
+        }
+
+        match with_timeout(
+            Duration::from_millis(timeout_ms),
+            self.button.wait_for_rising_edge(),
+        )
+        .await
+        {
+            Ok(()) => {
+                Timer::after(Duration::from_millis(self.config.debounce_ms)).await;
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Configure button for wakeup from sleep
+    fn enable_wakeup(&mut self) -> Result<(), ()> {
+        self.button
+            .wakeup_enable(true, WakeEvent::LowLevel)
+            .map_err(|_| ())
+    }
+}
+
 // Channels for inter-task communication
 static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, StateEvent, 8> = Channel::new();
 static EFFECT_CHANNEL: Channel<CriticalSectionRawMutex, Effect, 8> = Channel::new();
 static SLEEP_CHANNEL: Channel<CriticalSectionRawMutex, SleepCommand, 2> = Channel::new();
 static SEND_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
+static ESPNOW_REINIT_CHANNEL: Channel<CriticalSectionRawMutex, (), 2> = Channel::new();
 
 /// System state - persists across light sleep
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +385,7 @@ async fn state_manager() {
     let event_rx = EVENT_CHANNEL.receiver();
     let effect_tx = EFFECT_CHANNEL.sender();
     let sleep_tx = SLEEP_CHANNEL.sender();
+    let broadcast_tx = SEND_CHANNEL.sender();
 
     loop {
         let event = event_rx.receive().await;
@@ -237,6 +398,10 @@ async fn state_manager() {
             match effect {
                 Effect::RequestSleep => {
                     sleep_tx.send(SleepCommand::EnterSleep).await;
+                }
+                Effect::BroadcastState(_) => {
+                    // Broadcast current state to peer via ESP-NOW
+                    broadcast_tx.send(state.local_red).await;
                 }
                 _ => {
                     effect_tx.send(effect).await;
@@ -286,64 +451,36 @@ async fn led_controller(mut local: LedPair<'static>, mut remote: LedPair<'static
 }
 
 #[embassy_executor::task]
-async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
+async fn button_task(
+    mut button_handler: ButtonHandler<'static>,
+    mut rtc: Rtc<'static>,
+    mut wifi_controller: esp_radio::wifi::WifiController<'static>,
+) {
     info!("Button task started");
     let event_tx = EVENT_CHANNEL.sender();
     let sleep_rx = SLEEP_CHANNEL.receiver();
 
     loop {
         // Wait for either button press or sleep command
-        match select(button.wait_for_falling_edge(), sleep_rx.receive()).await {
-            Either::First(_) => {
-                // Button pressed
-                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-
-                let mut hold_time = Duration::from_millis(DEBOUNCE_MS);
-                let mut long_press_confirmed = false;
-                let mut aborted_during_blink = false;
-
-                while button.is_low() {
-                    if hold_time >= Duration::from_millis(LONG_PRESS_THRESHOLD_MS) {
-                        // Emit feedback event
-                        event_tx.send(StateEvent::ButtonLongPressStarted).await;
-
-                        // Wait for blink feedback to complete (600ms)
-                        for _ in 0..NUM_BLINKS {
-                            Timer::after(Duration::from_millis(BLINK_DURATION_MS * 2)).await;
-                            hold_time += Duration::from_millis(BLINK_DURATION_MS * 2);
-                            if !button.is_low() {
-                                // Button released during blink - debounce the release
-                                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-                                if !button.is_low() {
-                                    aborted_during_blink = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !aborted_during_blink
-                            && hold_time >= Duration::from_millis(LONG_PRESS_CONFIRM_MS)
-                        {
-                            long_press_confirmed = true;
-                        }
-                        break;
+        match select(button_handler.wait_for_press(), sleep_rx.receive()).await {
+            Either::First(button_event) => {
+                match button_event {
+                    ButtonEvent::Press => {
+                        event_tx.send(StateEvent::ButtonPress).await;
                     }
-
-                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
-                    hold_time += Duration::from_millis(BUTTON_POLL_MS);
-                }
-
-                // Debounce button release for normal press detection
-                if !long_press_confirmed && !aborted_during_blink {
-                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-                }
-
-                if long_press_confirmed {
-                    event_tx.send(StateEvent::ButtonLongPress).await;
-                } else if !aborted_during_blink
-                    && hold_time < Duration::from_millis(LONG_PRESS_THRESHOLD_MS)
-                {
-                    event_tx.send(StateEvent::ButtonPress).await;
+                    ButtonEvent::LongPressStarted => {
+                        // Emit the feedback event to trigger blink
+                        event_tx.send(StateEvent::ButtonLongPressStarted).await;
+                        // Continue monitoring for confirmation
+                        let confirm_event = button_handler.wait_for_long_press_confirm().await;
+                        if let ButtonEvent::LongPress = confirm_event {
+                            event_tx.send(StateEvent::ButtonLongPress).await;
+                        }
+                    }
+                    ButtonEvent::LongPress => {
+                        // Should not happen directly from wait_for_press anymore
+                        event_tx.send(StateEvent::ButtonLongPress).await;
+                    }
                 }
             }
             Either::Second(SleepCommand::EnterSleep) => {
@@ -351,15 +488,22 @@ async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
                 info!("Entering light sleep");
 
                 // Wait for button release before sleeping with debounce
-                if button.is_low() {
-                    button.wait_for_rising_edge().await;
-                    Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-                }
+                button_handler.wait_for_release().await;
                 Timer::after(Duration::from_millis(PRE_SLEEP_DELAY_MS)).await;
 
+                // Stop WiFi before sleep
+                info!("Stopping WiFi controller");
+                if let Err(e) = wifi_controller.stop() {
+                    log::error!("Failed to stop WiFi: {:?}", e);
+                }
+
                 // Configure wakeup
-                if let Err(e) = button.wakeup_enable(true, WakeEvent::LowLevel) {
+                if let Err(e) = button_handler.enable_wakeup() {
                     log::error!("Failed to enable button wakeup: {:?}", e);
+                    // Restart WiFi if wakeup config fails
+                    if let Err(e) = wifi_controller.start() {
+                        log::error!("Failed to restart WiFi after wakeup config error: {:?}", e);
+                    }
                     event_tx.send(StateEvent::WakeUp).await;
                     continue;
                 }
@@ -369,29 +513,36 @@ async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
 
                 // Woke up!
                 info!("Woke up from sleep");
+
+                // Restart WiFi after wake
+                info!("Restarting WiFi controller");
+                if let Err(e) = wifi_controller.start() {
+                    log::error!("Failed to restart WiFi after wake: {:?}", e);
+                }
+
+                // Signal ESP-NOW task to reinitialize after WiFi restart
+                info!("Signaling ESP-NOW reinitialization");
+                let _ = ESPNOW_REINIT_CHANNEL.send(()).await;
+
+                // Give WiFi and ESP-NOW time to stabilize
+                Timer::after(Duration::from_millis(500)).await;
+
                 event_tx.send(StateEvent::WakeUp).await;
 
                 // Wait for button release after wake with extended settling
                 Timer::after(Duration::from_millis(POST_WAKEUP_DELAY_MS)).await;
 
                 // Ensure button is released and stable before accepting new presses
-                if button.is_low() {
+                if button_handler.is_pressed() {
                     // Wait for button release with timeout (safety in case button is stuck)
-                    match with_timeout(
-                        Duration::from_millis(WAKEUP_TIMEOUT_MS),
-                        button.wait_for_rising_edge(),
-                    )
-                    .await
+                    if let Err(()) = button_handler
+                        .wait_for_release_timeout(WAKEUP_TIMEOUT_MS)
+                        .await
                     {
-                        Ok(()) => {
-                            Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "Button release timeout after {}ms, continuing anyway",
-                                WAKEUP_TIMEOUT_MS
-                            );
-                        }
+                        log::warn!(
+                            "Button release timeout after {}ms, continuing anyway",
+                            WAKEUP_TIMEOUT_MS
+                        );
                     }
                 }
 
@@ -407,27 +558,51 @@ async fn button_task(mut button: Input<'static>, mut rtc: Rtc<'static>) {
 async fn esp_now_task(mut esp_now: EspNow<'static>) {
     info!("ESP-NOW task started");
     let event_tx = EVENT_CHANNEL.sender();
+    let reinit_rx = ESPNOW_REINIT_CHANNEL.receiver();
 
     loop {
-        match select(esp_now.receive_async(), SEND_CHANNEL.receive()).await {
-            Either::First(res) => {
-                let data = res.data();
-                if !data.is_empty() {
-                    let peer_red = data[0] == 1;
-                    info!(
-                        "Data received from peer: {}",
-                        if peer_red { "RED" } else { "GREEN" }
-                    );
-                    event_tx.send(StateEvent::RemoteUpdate(peer_red)).await;
+        // Wait for either ESP-NOW receive, send request, or reinit signal
+        match select(
+            select(esp_now.receive_async(), SEND_CHANNEL.receive()),
+            reinit_rx.receive(),
+        )
+        .await
+        {
+            Either::First(either) => match either {
+                Either::First(res) => {
+                    let data = res.data();
+                    if !data.is_empty() {
+                        let peer_red = data[0] == 1;
+                        info!(
+                            "Data received from peer: {}",
+                            if peer_red { "RED" } else { "GREEN" }
+                        );
+                        event_tx.send(StateEvent::RemoteUpdate(peer_red)).await;
+                    }
                 }
-            }
-            Either::Second(local_red_state) => {
-                let status = if local_red_state { 1 } else { 0 };
-                let _ = esp_now.send_async(&BROADCAST_ADDRESS, &[status]).await;
-                info!(
-                    "Broadcasted local state: {}",
-                    if local_red_state { "RED" } else { "GREEN" }
-                );
+                Either::Second(local_red_state) => {
+                    let status = if local_red_state { 1 } else { 0 };
+                    match esp_now.send_async(&BROADCAST_ADDRESS, &[status]).await {
+                        Ok(()) => {
+                            info!(
+                                "Broadcasted local state: {}",
+                                if local_red_state { "RED" } else { "GREEN" }
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("Failed to broadcast ESP-NOW message: {:?}", e);
+                        }
+                    }
+                }
+            },
+            Either::Second(()) => {
+                // Reinitialize ESP-NOW after WiFi restart
+                info!("Reinitializing ESP-NOW after WiFi restart");
+                if let Err(e) = esp_now.set_channel(ESP_NOW_CHANNEL) {
+                    log::error!("Failed to reconfigure ESP-NOW channel: {:?}", e);
+                } else {
+                    info!("ESP-NOW channel reconfigured successfully");
+                }
             }
         }
     }
@@ -486,17 +661,21 @@ async fn main(spawner: Spawner) -> ! {
         Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
         Output::new(peripherals.GPIO20, Level::Low, OutputConfig::default()),
     );
-    let button = Input::new(
+
+    // Create button handler with default configuration
+    let button_handler = ButtonHandler::new(Input::new(
         peripherals.GPIO10,
         InputConfig::default().with_pull(Pull::Up),
-    );
+    ));
 
     // Spawn all tasks
     spawner.spawn(state_manager()).unwrap();
     spawner
         .spawn(led_controller(local_pair, remote_pair))
         .unwrap();
-    spawner.spawn(button_task(button, rtc)).unwrap();
+    spawner
+        .spawn(button_task(button_handler, rtc, wifi_controller))
+        .unwrap();
     spawner.spawn(esp_now_task(esp_now)).unwrap();
 
     info!("All tasks spawned");
