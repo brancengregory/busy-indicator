@@ -24,3 +24,26 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# KiCad autosaves and backups
+*-bak
+*.bck
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.sch-bak
+_autosave-*
+*.tmp
+*.lck
+busy-indicator-backups/
+
+# Manufacturing files (Gerbers, drill files)
+/hardware/gerbers/
+*.gbr
+*.drl
+*.pos
+*.csv
+*.zip
+*.gbrjob
+
+# KiCad cache files
+fp-info-cache
